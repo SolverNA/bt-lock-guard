@@ -32,6 +32,8 @@ Phone returns → unlock → grace period → monitoring resumes
 curl -fsSL https://raw.githubusercontent.com/SolVerNA/bt-lock-guard/master/install.sh | sudo bash
 ```
 
+Installer asks for the target Bluetooth MAC during setup.
+
 ### From source
 
 ```bash
@@ -39,6 +41,13 @@ git clone https://github.com/SolVerNA/bt-lock-guard
 cd bt-lock-guard
 sudo make install MAC=AA:BB:CC:DD:EE:FF
 ```
+
+`make install` now installs required Debian packages automatically (`bluez`, `python3-pyqt5`, `python3-dbus`).
+
+### Device selection in tray window
+
+There is currently **no device picker** in the tray popup.  
+The popup shows status and controls (enable/disable + threshold), while device binding is configured by MAC during install/setup.
 
 ## Requirements
 
