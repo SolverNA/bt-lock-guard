@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+bt-lock-daemon — Bluetooth Presence Lock for KDE Plasma (X11 / Kali Linux)
+
+Monitors a Bluetooth device by MAC address.
+If RSSI drops below threshold for N consecutive checks, locks the KDE screen.
+Writes real-time state to ~/.local/share/bt-lock-guard/state.json
+Reads config from ~/.config/bt-lock-guard/config.json
+
+https://github.com/SolVerNA/bt-lock-guard
+License: MIT
+"""
+
+import argparse
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+import fcntl
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+STATE_DIR   = os.path.expanduser("~/.local/share/bt-lock-guard")
+CONFIG_DIR  = os.path.expanduser("~/.config/bt-lock-guard")
+LOG_FILE    = os.path.join(STATE_DIR, "daemon.log")
+STATE_FILE  = os.path.join(STATE_DIR, "state.json")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+LOCK_FILE   = "/tmp/bt-lock-daemon.lock"
+
+os.makedirs(STATE_DIR, exist_ok=True)
+os.makedirs(CONFIG_DIR, exist_ok=True)
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("bt-lock-daemon")
+
+# ── Default config ─────────────────────────────────────────────────────────────
+DEFAULT_CONFIG = {
+    "mac":       "",
+    "threshold": -80,
+    "misses":    3,
+    "interval":  1,
+    "grace":     30,
+    "enabled":   True,
+}
+
+
+def load_config() -> dict:
+    """Load config from file, falling back to defaults."""
+    cfg = DEFAULT_CONFIG.copy()
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE) as f:
+                cfg.update(json.load(f))
+    except Exception as e:
+        log.warning("Could not read config: %s", e)
+    return cfg
+
+
+def write_state(mac: str, rssi: int | None, present: bool,
+                miss_count: int, locked: bool, enabled: bool,
+                threshold: int, status: str) -> None:
+    """Write current state to JSON for tray to read."""
+    state = {
+        "mac":        mac,
+        "rssi":       rssi,
+        "present":    present,
+        "miss_count": miss_count,
+        "locked":     locked,
+        "enabled":    enabled,
+        "threshold":  threshold,
+        "status":     status,
+        "ts":         time.time(),
+    }
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log.debug("State write error: %s", e)
+
+
+# ── BlueZ helpers ──────────────────────────────────────────────────────────────
+def get_rssi(mac: str) -> int | None:
+    """
+    Get RSSI via hcitool. Returns dBm integer or None.
+    Works only when device is actively connected.
+    """
+    try:
+        result = subprocess.run(
+            ["hcitool", "rssi", mac],
+            capture_output=True, text=True, timeout=2
+        )
+        # Output: "RSSI return value: -65"
+        for line in result.stdout.splitlines():
+            if "RSSI return value" in line:
+                return int(line.split(":")[-1].strip())
+    except Exception:
+        pass
+    return None
+
+
+def ping_device(mac: str) -> bool:
+    """l2ping — 1 packet, 1.5s timeout. Returns True if device responds."""
+    try:
+        result = subprocess.run(
+            ["l2ping", "-c", "1", "-t", "1", mac],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+    except FileNotFoundError:
+        log.error("l2ping not found: sudo apt install bluez")
+        sys.exit(1)
+
+
+def force_connect(mac: str) -> None:
+    """Async bluetoothctl connect — does not block main loop."""
+    try:
+        subprocess.Popen(
+            ["bluetoothctl", "connect", mac],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        log.debug("Connect error: %s", e)
+
+
+def trust_device(mac: str) -> None:
+    try:
+        subprocess.run(
+            ["bluetoothctl", "--timeout", "5", "trust", mac],
+            capture_output=True, timeout=7
+        )
+        log.info("Device %s trusted.", mac)
+    except Exception as e:
+        log.warning("Trust failed: %s", e)
+
+
+def probe_device(mac: str, attempt_connect: bool) -> tuple[bool, int | None]:
+    """
+    Returns (present: bool, rssi: int | None).
+    1. Try hcitool rssi (gives actual signal strength when connected)
+    2. Fall back to l2ping (binary present/absent)
+    """
+    rssi = get_rssi(mac)
+    if rssi is not None:
+        return True, rssi
+
+    # Device not connected or RSSI unavailable — use l2ping
+    present = ping_device(mac)
+    if not present and attempt_connect:
+        force_connect(mac)
+        time.sleep(0.3)
+        present = ping_device(mac)
+        if present:
+            rssi = get_rssi(mac)
+
+    return present, rssi
+
+
+# ── Session helpers ────────────────────────────────────────────────────────────
+def is_screen_locked() -> bool:
+    try:
+        sessions = subprocess.check_output(
+            ["loginctl", "list-sessions", "--no-legend"],
+            text=True, timeout=3
+        ).strip()
+        for line in sessions.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            sid = parts[0]
+            try:
+                info = subprocess.check_output(
+                    ["loginctl", "show-session", sid,
+                     "--property=LockedHint", "--property=Type"],
+                    text=True, timeout=3
+                )
+                if any(t in info for t in ("Type=x11", "Type=wayland", "Type=mir")):
+                    return "LockedHint=yes" in info
+            except Exception:
+                continue
+    except Exception as e:
+        log.debug("Session check error: %s", e)
+    return False
+
+
+def lock_screen() -> bool:
+    env = os.environ.copy()
+    uid = os.getuid()
+    bus = f"/run/user/{uid}/bus"
+    if "DBUS_SESSION_BUS_ADDRESS" not in env and os.path.exists(bus):
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+
+    for cmd in (
+        ["qdbus", "org.freedesktop.ScreenSaver", "/ScreenSaver", "Lock"],
+        ["loginctl", "lock-session"],
+    ):
+        try:
+            r = subprocess.run(cmd, env=env, capture_output=True, timeout=5)
+            if r.returncode == 0:
+                log.info("Screen locked via %s", cmd[0])
+                return True
+        except Exception:
+            continue
+    log.error("All lock methods failed.")
+    return False
+
+
+# ── Daemon ─────────────────────────────────────────────────────────────────────
+def daemonize() -> None:
+    if os.fork() > 0:
+        sys.exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        sys.exit(0)
+    with open(os.devnull, "r") as dn:
+        os.dup2(dn.fileno(), sys.stdin.fileno())
+    lf = open(LOG_FILE, "a")
+    os.dup2(lf.fileno(), sys.stdout.fileno())
+    os.dup2(lf.fileno(), sys.stderr.fileno())
+
+
+def handle_signal(signum, _frame):
+    log.info("Signal %d — exiting.", signum)
+    sys.exit(0)
+
+
+def monitor(mac: str, run_as_daemon: bool) -> None:
+    # PID lock
+    lf = open(LOCK_FILE, "w")
+    try:
+        fcntl.lockf(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        print("Already running. Exiting.")
+        sys.exit(1)
+
+    if run_as_daemon:
+        daemonize()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    trust_device(mac)
+
+    cfg              = load_config()
+    miss_count       = 0
+    was_locked       = is_screen_locked()
+    allow_connect    = True
+    cfg_reload_timer = 0
+
+    log.info("=" * 50)
+    log.info("bt-lock-daemon STARTED")
+    log.info("MAC       : %s", mac)
+    log.info("Threshold : %d dBm", cfg["threshold"])
+    log.info("Misses    : %d", cfg["misses"])
+    log.info("=" * 50)
+
+    while True:
+        # Reload config every 5 seconds (tray may have changed it)
+        now = time.time()
+        if now - cfg_reload_timer > 5:
+            cfg = load_config()
+            cfg_reload_timer = now
+
+        enabled   = cfg.get("enabled", True)
+        threshold = cfg.get("threshold", -80)
+        max_miss  = cfg.get("misses", 3)
+        interval  = cfg.get("interval", 1)
+        grace     = cfg.get("grace", 30)
+
+        # ── Disabled ──────────────────────────────────────────────────────────
+        if not enabled:
+            write_state(mac, None, False, 0, is_screen_locked(),
+                        False, threshold, "disabled")
+            time.sleep(2)
+            continue
+
+        currently_locked = is_screen_locked()
+
+        # ── Screen locked ─────────────────────────────────────────────────────
+        if currently_locked:
+            if not was_locked:
+                log.info("[LOCKED] Monitoring paused.")
+            was_locked  = True
+            miss_count  = 0
+            allow_connect = True
+            write_state(mac, None, False, 0, True, True, threshold, "locked")
+            time.sleep(2)
+            continue
+
+        # ── Just unlocked — grace period ──────────────────────────────────────
+        if was_locked and not currently_locked:
+            log.info("[UNLOCKED] Grace period %d sec...", grace)
+            force_connect(mac)
+            write_state(mac, None, True, 0, False, True, threshold, "grace")
+            time.sleep(grace)
+            was_locked  = False
+            miss_count  = 0
+            allow_connect = True
+            continue
+
+        # ── Active monitoring ─────────────────────────────────────────────────
+        present, rssi = probe_device(mac, allow_connect)
+
+        # Threshold check: if RSSI is known and below threshold → treat as miss
+        if rssi is not None and rssi < threshold:
+            present = False
+            log.debug("[RSSI] %d dBm < threshold %d dBm", rssi, threshold)
+
+        if present:
+            if miss_count > 0:
+                log.info("[OK] Signal restored after %d miss(es). RSSI=%s",
+                         miss_count, rssi)
+            miss_count    = 0
+            allow_connect = False
+            write_state(mac, rssi, True, 0, False, True, threshold, "ok")
+        else:
+            miss_count   += 1
+            allow_connect = True
+            log.warning("[MISS] No signal (%d/%d). RSSI=%s", miss_count, max_miss, rssi)
+            write_state(mac, rssi if rssi else -100, False,
+                        miss_count, False, True, threshold, "miss")
+
+            if miss_count >= max_miss:
+                log.warning("[LOCK] Limit %d reached. LOCKING!", max_miss)
+                if lock_screen():
+                    was_locked = True
+                    miss_count = 0
+                else:
+                    miss_count = 0
+
+        time.sleep(interval)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="Lock KDE screen when Bluetooth device leaves range."
+    )
+    parser.add_argument("--mac", required=True, metavar="AA:BB:CC:DD:EE:FF")
+    parser.add_argument("--daemon", action="store_true",
+                        help="Run as background daemon")
+    args = parser.parse_args()
+
+    parts = args.mac.upper().split(":")
+    if len(parts) != 6 or not all(
+        len(p) == 2 and all(c in "0123456789ABCDEF" for c in p) for p in parts
+    ):
+        parser.error(f"Invalid MAC: {args.mac}")
+
+    # Write initial config if missing
+    if not os.path.exists(CONFIG_FILE):
+        cfg = DEFAULT_CONFIG.copy()
+        cfg["mac"] = args.mac.upper()
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+
+    monitor(mac=args.mac.upper(), run_as_daemon=args.daemon)
+
+
+if __name__ == "__main__":
+    main()

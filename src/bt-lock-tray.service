@@ -1,0 +1,19 @@
+[Unit]
+Description=BT Lock Guard — system tray applet
+Documentation=https://github.com/SolVerNA/bt-lock-guard
+After=graphical-session.target dbus.service
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bt-lock-tray
+Restart=on-failure
+RestartSec=3
+
+PassEnvironment=DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

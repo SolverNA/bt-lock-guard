@@ -1,0 +1,19 @@
+[Unit]
+Description=BT Lock Guard — Bluetooth presence lock daemon
+Documentation=https://github.com/SolVerNA/bt-lock-guard
+After=graphical-session.target bluetooth.target dbus.service
+Wants=graphical-session.target bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bt-lock-daemon --mac %i
+Restart=on-failure
+RestartSec=5
+
+PassEnvironment=DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

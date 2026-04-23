@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""
+bt-lock-tray — KDE system tray applet for bt-lock-guard
+
+Shows in system tray (near Wi-Fi/clock).
+Click → popup with:
+  - Enable/disable toggle
+  - RSSI threshold slider
+  - Real-time signal graph
+
+https://github.com/SolVerNA/bt-lock-guard
+License: MIT
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from collections import deque
+
+from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, QSize
+from PyQt5.QtGui import (
+    QColor, QFont, QIcon, QPainter, QPen, QPixmap,
+    QPainterPath, QLinearGradient, QBrush
+)
+from PyQt5.QtWidgets import (
+    QApplication, QFrame, QHBoxLayout, QLabel,
+    QSlider, QSystemTrayIcon, QVBoxLayout, QWidget, QMenu, QAction
+)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+STATE_FILE  = os.path.expanduser("~/.local/share/bt-lock-guard/state.json")
+CONFIG_FILE = os.path.expanduser("~/.config/bt-lock-guard/config.json")
+CONFIG_DIR  = os.path.expanduser("~/.config/bt-lock-guard")
+
+GRAPH_LEN   = 60   # seconds of history
+
+DEFAULT_CFG = {
+    "mac":       "",
+    "threshold": -80,
+    "misses":    3,
+    "interval":  1,
+    "grace":     30,
+    "enabled":   True,
+}
+
+# ── Colors ─────────────────────────────────────────────────────────────────────
+C_BG      = QColor(28, 28, 32)
+C_SURFACE = QColor(38, 38, 44)
+C_BORDER  = QColor(60, 60, 70)
+C_TEXT    = QColor(220, 220, 225)
+C_MUTED   = QColor(130, 130, 140)
+C_GREEN   = QColor(50, 200, 120)
+C_RED     = QColor(220, 70, 70)
+C_AMBER   = QColor(240, 165, 40)
+C_BLUE    = QColor(80, 160, 240)
+C_GRAPH   = QColor(80, 160, 240, 200)
+C_THRESH  = QColor(220, 70, 70, 160)
+
+
+# ── Toggle switch widget ───────────────────────────────────────────────────────
+class ToggleSwitch(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._checked = True
+        self._anim    = 1.0
+        self.setFixedSize(48, 26)
+        self.setCursor(Qt.PointingHandCursor)
+        self._on_change = None
+
+    def setChecked(self, v: bool):
+        self._checked = v
+        self._anim    = 1.0 if v else 0.0
+        self.update()
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def onChanged(self, fn):
+        self._on_change = fn
+
+    def mousePressEvent(self, _):
+        self._checked = not self._checked
+        self._anim    = 1.0 if self._checked else 0.0
+        self.update()
+        if self._on_change:
+            self._on_change(self._checked)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        r = h / 2
+
+        # Track
+        track_color = C_GREEN if self._checked else C_BORDER
+        p.setPen(Qt.NoPen)
+        p.setBrush(track_color)
+        p.drawRoundedRect(0, 0, w, h, r, r)
+
+        # Thumb
+        margin = 3
+        travel = w - h
+        x = margin + travel * self._anim
+        p.setBrush(QColor(255, 255, 255))
+        size = h - 2 * margin
+        p.drawEllipse(int(x), margin, size, size)
+        p.end()
+
+
+# ── RSSI graph widget ──────────────────────────────────────────────────────────
+class RSSIGraph(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(280, 120)
+        self._data:      deque = deque(maxlen=GRAPH_LEN)
+        self._threshold: int   = -80
+        self._rssi:      int | None = None
+
+    def push(self, rssi: int | None):
+        self._rssi = rssi
+        self._data.append(rssi if rssi is not None else -100)
+        self.update()
+
+    def setThreshold(self, v: int):
+        self._threshold = v
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # Background
+        p.setPen(Qt.NoPen)
+        p.setBrush(C_SURFACE)
+        p.drawRoundedRect(0, 0, w, h, 8, 8)
+
+        pad_l, pad_r, pad_t, pad_b = 38, 12, 10, 22
+        gw = w - pad_l - pad_r
+        gh = h - pad_t - pad_b
+
+        rssi_min, rssi_max = -100, -30
+
+        def y_for(v: int) -> float:
+            frac = (v - rssi_min) / (rssi_max - rssi_min)
+            return pad_t + gh - frac * gh
+
+        def x_for(i: int, n: int) -> float:
+            if n <= 1:
+                return pad_l + gw / 2
+            return pad_l + (i / (n - 1)) * gw
+
+        # Grid lines
+        p.setPen(QPen(C_BORDER, 0.5, Qt.DotLine))
+        for v in (-90, -80, -70, -60, -50, -40):
+            yy = y_for(v)
+            p.drawLine(int(pad_l), int(yy), int(pad_l + gw), int(yy))
+            p.setPen(QPen(C_MUTED))
+            p.setFont(QFont("monospace", 8))
+            p.drawText(2, int(yy) + 4, f"{v}")
+            p.setPen(QPen(C_BORDER, 0.5, Qt.DotLine))
+
+        # Threshold line
+        ty = y_for(self._threshold)
+        p.setPen(QPen(C_THRESH, 1.5, Qt.DashLine))
+        p.drawLine(int(pad_l), int(ty), int(pad_l + gw), int(ty))
+        p.setPen(QPen(C_RED))
+        p.setFont(QFont("monospace", 8))
+        p.drawText(int(pad_l + 2), int(ty) - 3, f"thr {self._threshold}")
+
+        # Signal line + fill
+        data  = list(self._data)
+        n     = len(data)
+        if n >= 2:
+            path = QPainterPath()
+            fill = QPainterPath()
+            x0 = x_for(0, n)
+            y0 = y_for(data[0])
+            path.moveTo(x0, y0)
+            fill.moveTo(x0, pad_t + gh)
+            fill.lineTo(x0, y0)
+            for i in range(1, n):
+                xi = x_for(i, n)
+                yi = y_for(data[i])
+                path.lineTo(xi, yi)
+                fill.lineTo(xi, yi)
+            fill.lineTo(x_for(n - 1, n), pad_t + gh)
+            fill.closeSubpath()
+
+            grad = QLinearGradient(0, pad_t, 0, pad_t + gh)
+            grad.setColorAt(0, QColor(80, 160, 240, 60))
+            grad.setColorAt(1, QColor(80, 160, 240, 5))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(grad))
+            p.drawPath(fill)
+
+            p.setPen(QPen(C_GRAPH, 1.5))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+
+            # Last point dot
+            last_x = x_for(n - 1, n)
+            last_y = y_for(data[-1])
+            color = C_GREEN if data[-1] > self._threshold else C_RED
+            p.setPen(Qt.NoPen)
+            p.setBrush(color)
+            p.drawEllipse(int(last_x) - 4, int(last_y) - 4, 8, 8)
+
+        # X axis label
+        p.setPen(QPen(C_MUTED))
+        p.setFont(QFont("sans-serif", 8))
+        p.drawText(pad_l, h - 4, f"← {GRAPH_LEN}s")
+        p.drawText(w - 30, h - 4, "now")
+
+        p.end()
+
+
+# ── Tray icon painter ──────────────────────────────────────────────────────────
+def make_tray_icon(status: str) -> QIcon:
+    """
+    Draw Bluetooth icon with status dot.
+    status: 'ok' | 'miss' | 'disabled' | 'locked' | 'grace'
+    """
+    sz  = 22
+    pix = QPixmap(sz, sz)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    # Bluetooth symbol (simplified B-shape)
+    color = {
+        "ok":       C_BLUE,
+        "miss":     C_AMBER,
+        "disabled": C_MUTED,
+        "locked":   C_RED,
+        "grace":    C_AMBER,
+    }.get(status, C_MUTED)
+
+    pen = QPen(color, 2.0)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+
+    cx, cy = sz / 2, sz / 2 - 1
+    h2 = 7
+
+    # Vertical line
+    p.drawLine(int(cx), int(cy - h2), int(cx), int(cy + h2))
+    # Upper-right diagonal
+    p.drawLine(int(cx), int(cy - h2), int(cx + 4), int(cy - 3))
+    p.drawLine(int(cx + 4), int(cy - 3), int(cx), int(cy))
+    # Lower-right diagonal
+    p.drawLine(int(cx), int(cy), int(cx + 4), int(cy + 3))
+    p.drawLine(int(cx + 4), int(cy + 3), int(cx), int(cy + h2))
+
+    # Status dot
+    dot_color = {
+        "ok":       C_GREEN,
+        "miss":     C_AMBER,
+        "disabled": C_MUTED,
+        "locked":   C_RED,
+        "grace":    C_AMBER,
+    }.get(status, C_MUTED)
+    p.setPen(Qt.NoPen)
+    p.setBrush(dot_color)
+    p.drawEllipse(sz - 7, sz - 7, 6, 6)
+
+    p.end()
+    return QIcon(pix)
+
+
+# ── Popup window ───────────────────────────────────────────────────────────────
+class PopupWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self._build_ui()
+        self._visible = False
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._card = QFrame(self)
+        self._card.setStyleSheet(f"""
+            QFrame {{
+                background: {C_BG.name()};
+                border: 1px solid {C_BORDER.name()};
+                border-radius: 12px;
+            }}
+        """)
+        outer.addWidget(self._card)
+
+        lay = QVBoxLayout(self._card)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(12)
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        self._title = QLabel("BT Lock Guard")
+        self._title.setStyleSheet(f"color: {C_TEXT.name()}; font-size: 14px; font-weight: 600; border: none;")
+        self._status_lbl = QLabel("●")
+        self._status_lbl.setStyleSheet(f"color: {C_MUTED.name()}; font-size: 18px; border: none;")
+        hdr.addWidget(self._title)
+        hdr.addStretch()
+        hdr.addWidget(self._status_lbl)
+        lay.addLayout(hdr)
+
+        # ── MAC + RSSI row ────────────────────────────────────────────────────
+        self._mac_lbl = QLabel("--:--:--:--:--:--")
+        self._mac_lbl.setStyleSheet(f"color: {C_MUTED.name()}; font-size: 11px; font-family: monospace; border: none;")
+        lay.addWidget(self._mac_lbl)
+
+        rssi_row = QHBoxLayout()
+        rssi_lbl = QLabel("RSSI")
+        rssi_lbl.setStyleSheet(f"color: {C_MUTED.name()}; font-size: 12px; border: none;")
+        self._rssi_val = QLabel("— dBm")
+        self._rssi_val.setStyleSheet(f"color: {C_TEXT.name()}; font-size: 18px; font-weight: 600; font-family: monospace; border: none;")
+        rssi_row.addWidget(rssi_lbl)
+        rssi_row.addStretch()
+        rssi_row.addWidget(self._rssi_val)
+        lay.addLayout(rssi_row)
+
+        # ── Divider ───────────────────────────────────────────────────────────
+        div = QFrame()
+        div.setFrameShape(QFrame.HLine)
+        div.setStyleSheet(f"color: {C_BORDER.name()}; border: none; border-top: 1px solid {C_BORDER.name()};")
+        lay.addWidget(div)
+
+        # ── Toggle row ────────────────────────────────────────────────────────
+        tog_row = QHBoxLayout()
+        tog_lbl = QLabel("Guard enabled")
+        tog_lbl.setStyleSheet(f"color: {C_TEXT.name()}; font-size: 13px; border: none;")
+        self._toggle = ToggleSwitch()
+        self._toggle.onChanged(self._on_toggle)
+        tog_row.addWidget(tog_lbl)
+        tog_row.addStretch()
+        tog_row.addWidget(self._toggle)
+        lay.addLayout(tog_row)
+
+        # ── Threshold slider ──────────────────────────────────────────────────
+        thr_hdr = QHBoxLayout()
+        thr_lbl = QLabel("Lock threshold")
+        thr_lbl.setStyleSheet(f"color: {C_TEXT.name()}; font-size: 13px; border: none;")
+        self._thr_val = QLabel("-80 dBm")
+        self._thr_val.setStyleSheet(f"color: {C_AMBER.name()}; font-size: 13px; font-family: monospace; border: none;")
+        thr_hdr.addWidget(thr_lbl)
+        thr_hdr.addStretch()
+        thr_hdr.addWidget(self._thr_val)
+        lay.addLayout(thr_hdr)
+
+        self._slider = QSlider(Qt.Horizontal)
+        self._slider.setRange(-100, -30)
+        self._slider.setValue(-80)
+        self._slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 4px;
+                background: #3c3c46;
+                border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #50a0f0;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                width: 16px;
+                height: 16px;
+                margin: -6px 0;
+                background: white;
+                border-radius: 8px;
+            }
+        """)
+        self._slider.valueChanged.connect(self._on_slider)
+        lay.addWidget(self._slider)
+
+        # Slider labels
+        sl_row = QHBoxLayout()
+        for txt in ["-100 dBm\n(very far)", "-70 dBm\n(medium)", "-30 dBm\n(close)"]:
+            l = QLabel(txt)
+            l.setStyleSheet(f"color: {C_MUTED.name()}; font-size: 9px; border: none;")
+            l.setAlignment(Qt.AlignCenter)
+            sl_row.addWidget(l)
+        lay.addLayout(sl_row)
+
+        # ── Graph ─────────────────────────────────────────────────────────────
+        div2 = QFrame()
+        div2.setFrameShape(QFrame.HLine)
+        div2.setStyleSheet(f"color: {C_BORDER.name()}; border: none; border-top: 1px solid {C_BORDER.name()};")
+        lay.addWidget(div2)
+
+        graph_hdr = QLabel("Signal history")
+        graph_hdr.setStyleSheet(f"color: {C_MUTED.name()}; font-size: 11px; border: none;")
+        lay.addWidget(graph_hdr)
+
+        self._graph = RSSIGraph()
+        lay.addWidget(self._graph)
+
+        # ── Footer status ─────────────────────────────────────────────────────
+        self._footer = QLabel("Connecting to daemon...")
+        self._footer.setStyleSheet(f"color: {C_MUTED.name()}; font-size: 11px; border: none;")
+        self._footer.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self._footer)
+
+        self.adjustSize()
+
+    def _on_toggle(self, checked: bool):
+        cfg = self._load_cfg()
+        cfg["enabled"] = checked
+        self._save_cfg(cfg)
+
+    def _on_slider(self, val: int):
+        self._thr_val.setText(f"{val} dBm")
+        self._graph.setThreshold(val)
+        cfg = self._load_cfg()
+        cfg["threshold"] = val
+        self._save_cfg(cfg)
+
+    def _load_cfg(self) -> dict:
+        cfg = DEFAULT_CFG.copy()
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE) as f:
+                    cfg.update(json.load(f))
+        except Exception:
+            pass
+        return cfg
+
+    def _save_cfg(self, cfg: dict):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(cfg, f, indent=2)
+        except Exception as e:
+            print(f"Config save error: {e}")
+
+    def update_from_state(self, state: dict):
+        """Called every second by timer."""
+        mac       = state.get("mac", "")
+        rssi      = state.get("rssi")
+        enabled   = state.get("enabled", True)
+        threshold = state.get("threshold", -80)
+        status    = state.get("status", "unknown")
+        miss      = state.get("miss_count", 0)
+
+        self._mac_lbl.setText(mac or "no MAC configured")
+        self._toggle.setChecked(enabled)
+        self._slider.blockSignals(True)
+        self._slider.setValue(threshold)
+        self._slider.blockSignals(False)
+        self._thr_val.setText(f"{threshold} dBm")
+        self._graph.setThreshold(threshold)
+        self._graph.push(rssi)
+
+        if rssi is not None:
+            self._rssi_val.setText(f"{rssi} dBm")
+            if rssi > threshold:
+                self._rssi_val.setStyleSheet(f"color: {C_GREEN.name()}; font-size: 18px; font-weight: 600; font-family: monospace; border: none;")
+            else:
+                self._rssi_val.setStyleSheet(f"color: {C_RED.name()}; font-size: 18px; font-weight: 600; font-family: monospace; border: none;")
+        else:
+            self._rssi_val.setText("— dBm")
+            self._rssi_val.setStyleSheet(f"color: {C_MUTED.name()}; font-size: 18px; font-weight: 600; font-family: monospace; border: none;")
+
+        status_map = {
+            "ok":       (C_GREEN,  "●", f"Connected  miss={miss}"),
+            "miss":     (C_AMBER,  "●", f"Signal weak  miss={miss}/{state.get('misses',3)}"),
+            "locked":   (C_RED,    "🔒", "Screen locked"),
+            "disabled": (C_MUTED,  "○", "Guard disabled"),
+            "grace":    (C_AMBER,  "●", "Grace period (reconnecting…)"),
+        }
+        col, dot, footer = status_map.get(status, (C_MUTED, "●", status))
+        self._status_lbl.setText(dot)
+        self._status_lbl.setStyleSheet(f"color: {col.name()}; font-size: 18px; border: none;")
+        self._footer.setText(footer)
+
+    def update_no_daemon(self):
+        """Called when state file is missing (daemon not running)."""
+        self._footer.setText("⚠ Daemon not running")
+        self._footer.setStyleSheet(f"color: {C_RED.name()}; font-size: 11px; border: none;")
+        self._rssi_val.setText("— dBm")
+        self._graph.push(None)
+
+    def show_near_tray(self, tray_geom):
+        """Position popup above tray icon."""
+        self.adjustSize()
+        sw = QApplication.primaryScreen().availableGeometry()
+        x = tray_geom.center().x() - self.width() // 2
+        y = tray_geom.top() - self.height() - 8
+        x = max(4, min(x, sw.width() - self.width() - 4))
+        y = max(4, y)
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._visible = True
+
+    def hideEvent(self, _):
+        self._visible = False
+
+    def focusOutEvent(self, _):
+        self.hide()
+
+
+# ── Main tray application ──────────────────────────────────────────────────────
+class BtLockTray:
+    def __init__(self, app: QApplication):
+        self._app    = app
+        self._popup  = PopupWindow()
+        self._tray   = QSystemTrayIcon()
+        self._last_status = ""
+
+        self._tray.setIcon(make_tray_icon("disabled"))
+        self._tray.setToolTip("BT Lock Guard")
+        self._tray.activated.connect(self._on_tray_click)
+
+        menu = QMenu()
+        act_quit = QAction("Quit bt-lock-tray", menu)
+        act_quit.triggered.connect(app.quit)
+        menu.addAction(act_quit)
+        self._tray.setContextMenu(menu)
+
+        self._tray.show()
+
+        self._timer = QTimer()
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    def _tick(self):
+        state = self._read_state()
+        status = state.get("status", "disabled") if state else "disabled"
+
+        if status != self._last_status:
+            self._tray.setIcon(make_tray_icon(status))
+            self._last_status = status
+
+            tip = {
+                "ok":       "BT Lock Guard — Connected",
+                "miss":     "BT Lock Guard — Signal weak",
+                "locked":   "BT Lock Guard — Screen locked",
+                "disabled": "BT Lock Guard — Disabled",
+                "grace":    "BT Lock Guard — Grace period",
+            }.get(status, "BT Lock Guard")
+            self._tray.setToolTip(tip)
+
+        if self._popup._visible:
+            if state:
+                self._popup.update_from_state(state)
+            else:
+                self._popup.update_no_daemon()
+
+    def _read_state(self) -> dict | None:
+        try:
+            if not os.path.exists(STATE_FILE):
+                return None
+            mtime = os.path.getmtime(STATE_FILE)
+            if time.time() - mtime > 10:
+                return None
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def _on_tray_click(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            if self._popup._visible:
+                self._popup.hide()
+            else:
+                state = self._read_state()
+                if state:
+                    self._popup.update_from_state(state)
+                else:
+                    self._popup.update_no_daemon()
+                geom = self._tray.geometry()
+                self._popup.show_near_tray(geom)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        print("No system tray available.")
+        sys.exit(1)
+
+    tray = BtLockTray(app)  # noqa: F841 — keeps object alive
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
