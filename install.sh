@@ -12,6 +12,7 @@ error() { echo -e "${RED}[x]${NC} $*"; exit 1; }
 [[ $EUID -ne 0 ]] && error "Run with sudo: sudo bash install.sh"
 command -v python3   > /dev/null || error "python3 not found"
 command -v systemctl > /dev/null || error "systemd not found"
+command -v curl      > /dev/null || error "curl not found"
 
 # ── MAC address ───────────────────────────────────────────────────────────────
 echo ""
@@ -28,13 +29,25 @@ apt-get install -y bluez python3-pyqt5 python3-dbus 2>/dev/null || \
 
 # ── Files ────────────────────────────────────────────────────────────────────
 TMP="$(mktemp -d)"
-REPO="https://raw.githubusercontent.com/SolVerNA/bt-lock-guard/master"
+
+fetch_raw() {
+    local path="$1"
+    local out="$2"
+    local ok=1
+    for ref in master main; do
+        if curl -fsSL "https://raw.githubusercontent.com/SolverNA/bt-lock-guard/${ref}/${path}" -o "$out"; then
+            ok=0
+            break
+        fi
+    done
+    return "$ok"
+}
 
 info "Downloading..."
-curl -fsSL "$REPO/src/bt-lock-daemon"          -o "$TMP/bt-lock-daemon"
-curl -fsSL "$REPO/src/bt-lock-tray"            -o "$TMP/bt-lock-tray"
-curl -fsSL "$REPO/src/bt-lock-daemon@.service" -o "$TMP/bt-lock-daemon@.service"
-curl -fsSL "$REPO/src/bt-lock-tray.service"    -o "$TMP/bt-lock-tray.service"
+fetch_raw "src/bt-lock-daemon"          "$TMP/bt-lock-daemon"          || error "Failed to download bt-lock-daemon"
+fetch_raw "src/bt-lock-tray"            "$TMP/bt-lock-tray"            || error "Failed to download bt-lock-tray"
+fetch_raw "src/bt-lock-daemon@.service" "$TMP/bt-lock-daemon@.service" || error "Failed to download bt-lock-daemon@.service"
+fetch_raw "src/bt-lock-tray.service"    "$TMP/bt-lock-tray.service"    || error "Failed to download bt-lock-tray.service"
 
 info "Installing files..."
 install -Dm755 "$TMP/bt-lock-daemon"          /usr/local/bin/bt-lock-daemon

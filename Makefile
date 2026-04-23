@@ -1,6 +1,7 @@
 NAME    = bt-lock-guard
 VERSION = 1.0.0
 PREFIX  ?= /usr/local
+MAC_RE  = ^([0-9A-F]{2}:){5}[0-9A-F]{2}$$
 
 .PHONY: all install uninstall setup help
 
@@ -14,7 +15,13 @@ help:
 
 install:
 	@[ -n "$(MAC)" ] || (echo "Usage: sudo make install MAC=AA:BB:CC:DD:EE:FF"; exit 1)
+	@echo "$(MAC)" | tr '[:lower:]' '[:upper:]' | grep -Eq '$(MAC_RE)' || (echo "Invalid MAC: $(MAC)"; exit 1)
 	@echo "==> Installing $(NAME)..."
+	@if command -v apt-get >/dev/null 2>&1; then \
+		echo "==> Installing dependencies..."; \
+		apt-get update -qq || true; \
+		apt-get install -y bluez python3-pyqt5 python3-dbus; \
+	fi
 
 	install -Dm755 src/bt-lock-daemon           $(DESTDIR)$(PREFIX)/bin/bt-lock-daemon
 	install -Dm755 src/bt-lock-tray             $(DESTDIR)$(PREFIX)/bin/bt-lock-tray
@@ -24,14 +31,15 @@ install:
 	systemctl daemon-reload 2>/dev/null || true
 
 	REAL_USER="$${SUDO_USER:-$$USER}"; \
+	MAC_UPPER="$$(echo "$(MAC)" | tr '[:lower:]' '[:upper:]')"; \
 	su -l "$$REAL_USER" -s /bin/bash -c " \
 	    mkdir -p ~/.config/bt-lock-guard ~/.local/share/bt-lock-guard; \
-	    echo '{\"mac\":\"$(MAC)\",\"threshold\":-80,\"misses\":3,\"interval\":1,\"grace\":30,\"enabled\":true}' \
+	    echo '{\"mac\":\"'\"$$MAC_UPPER\"'\",\"threshold\":-80,\"misses\":3,\"interval\":1,\"grace\":30,\"enabled\":true}' \
 	        > ~/.config/bt-lock-guard/config.json; \
 	    systemctl --user daemon-reload; \
-	    systemctl --user enable --now bt-lock-daemon@$(MAC); \
+	    systemctl --user enable --now bt-lock-daemon@$$MAC_UPPER; \
 	    systemctl --user enable --now bt-lock-tray; \
-	" || echo "[!] Run 'make setup MAC=$(MAC)' as your normal user"
+	" || echo "[!] Run 'make setup MAC=$$MAC_UPPER' as your normal user"
 
 	@echo ""
 	@echo "==> $(NAME) installed!"
@@ -40,11 +48,13 @@ install:
 
 setup:
 	@[ -n "$(MAC)" ] || (echo "Usage: make setup MAC=AA:BB:CC:DD:EE:FF"; exit 1)
-	mkdir -p ~/.config/bt-lock-guard ~/.local/share/bt-lock-guard
-	echo '{"mac":"$(MAC)","threshold":-80,"misses":3,"interval":1,"grace":30,"enabled":true}' \
-	    > ~/.config/bt-lock-guard/config.json
-	systemctl --user daemon-reload
-	systemctl --user enable --now bt-lock-daemon@$(MAC)
+	@echo "$(MAC)" | tr '[:lower:]' '[:upper:]' | grep -Eq '$(MAC_RE)' || (echo "Invalid MAC: $(MAC)"; exit 1)
+	@MAC_UPPER="$$(echo "$(MAC)" | tr '[:lower:]' '[:upper:]')"; \
+	mkdir -p ~/.config/bt-lock-guard ~/.local/share/bt-lock-guard; \
+	echo '{"mac":"'"$$MAC_UPPER"'","threshold":-80,"misses":3,"interval":1,"grace":30,"enabled":true}' \
+	    > ~/.config/bt-lock-guard/config.json; \
+	systemctl --user daemon-reload; \
+	systemctl --user enable --now bt-lock-daemon@$$MAC_UPPER; \
 	systemctl --user enable --now bt-lock-tray
 	@echo "==> Services started."
 

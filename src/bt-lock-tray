@@ -236,6 +236,8 @@ def make_tray_icon(status: str) -> QIcon:
         "disabled": C_MUTED,
         "locked":   C_RED,
         "grace":    C_AMBER,
+        "bt_off":   C_MUTED,
+        "pairing":  C_BLUE,
     }.get(status, C_MUTED)
 
     pen = QPen(color, 2.0)
@@ -261,6 +263,8 @@ def make_tray_icon(status: str) -> QIcon:
         "disabled": C_MUTED,
         "locked":   C_RED,
         "grace":    C_AMBER,
+        "bt_off":   C_MUTED,
+        "pairing":  C_BLUE,
     }.get(status, C_MUTED)
     p.setPen(Qt.NoPen)
     p.setBrush(dot_color)
@@ -471,6 +475,8 @@ class PopupWindow(QWidget):
             "locked":   (C_RED,    "🔒", "Screen locked"),
             "disabled": (C_MUTED,  "○", "Guard disabled"),
             "grace":    (C_AMBER,  "●", "Grace period (reconnecting…)"),
+            "bt_off":   (C_MUTED,  "○", "Bluetooth is off — powering on…"),
+            "pairing":  (C_BLUE,   "●", "Pairing with device…"),
         }
         col, dot, footer = status_map.get(status, (C_MUTED, "●", status))
         self._status_lbl.setText(dot)
@@ -544,6 +550,8 @@ class BtLockTray:
                 "locked":   "BT Lock Guard — Screen locked",
                 "disabled": "BT Lock Guard — Disabled",
                 "grace":    "BT Lock Guard — Grace period",
+                "bt_off":   "BT Lock Guard — Bluetooth off",
+                "pairing":  "BT Lock Guard — Pairing…",
             }.get(status, "BT Lock Guard")
             self._tray.setToolTip(tip)
 
