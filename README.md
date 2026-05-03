@@ -26,23 +26,28 @@ Phone returns → unlock → grace period → monitoring resumes
 
 ## Install
 
-### One-liner (auto-detects Arch/Manjaro, Debian/Ubuntu/Kali, Fedora)
+### One-liner (Arch/Manjaro, Debian/Ubuntu/Kali, Fedora)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SolVerNA/bt-lock-guard/master/install.sh | sudo bash
 ```
 
-Installer detects your package manager, installs the right dependencies, and asks for the target Bluetooth MAC during setup.
+The installer:
+1. Detects your package manager and installs dependencies
+2. **Scans for nearby Bluetooth devices** and shows a numbered list
+3. You pick your phone/watch by number — no manual MAC entry needed
+4. Starts the daemon and tray automatically
 
 ### From source
 
 ```bash
 git clone https://github.com/SolVerNA/bt-lock-guard
 cd bt-lock-guard
+# Install files + start tray, then pick device from GUI:
+sudo make install
+# — or specify MAC directly:
 sudo make install MAC=AA:BB:CC:DD:EE:FF
 ```
-
-`make install` detects and installs required packages automatically.
 
 ### Arch Linux / Manjaro (manual)
 
@@ -63,10 +68,10 @@ cd bt-lock-guard
 sudo make install MAC=AA:BB:CC:DD:EE:FF
 ```
 
-### Device selection in tray window
+### Changing device from the tray
 
-There is currently **no device picker** in the tray popup.  
-The popup shows status and controls (enable/disable + threshold), while device binding is configured by MAC during install/setup.
+Click the tray icon → **"Scan & pick device"** at the bottom of the popup.  
+The tray will scan for 8 seconds, show a list of nearby Bluetooth devices, and let you switch with one click — no reinstall needed.
 
 ## Requirements
 

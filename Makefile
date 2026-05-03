@@ -9,13 +9,12 @@ all: help
 
 help:
 	@echo "Targets:"
-	@echo "  sudo make install MAC=AA:BB:CC:DD:EE:FF   install + configure"
+	@echo "  sudo make install                          install files + tray (pick device from GUI)"
+	@echo "  sudo make install MAC=AA:BB:CC:DD:EE:FF   install + configure device immediately"
 	@echo "  sudo make uninstall                        remove everything"
 	@echo "       make setup  MAC=AA:BB:CC:DD:EE:FF     re-run user setup"
 
 install:
-	@[ -n "$(MAC)" ] || (echo "Usage: sudo make install MAC=AA:BB:CC:DD:EE:FF"; exit 1)
-	@echo "$(MAC)" | tr '[:lower:]' '[:upper:]' | grep -Eq '$(MAC_RE)' || (echo "Invalid MAC: $(MAC)"; exit 1)
 	@echo "==> Installing $(NAME)..."
 	@echo "==> Installing dependencies..."; \
 	if command -v pacman >/dev/null 2>&1; then \
@@ -37,28 +36,42 @@ install:
 
 	systemctl daemon-reload 2>/dev/null || true
 
-	REAL_USER="$${SUDO_USER:-$$USER}"; \
-	MAC_UPPER="$$(echo "$(MAC)" | tr '[:lower:]' '[:upper:]')"; \
-	su -l "$$REAL_USER" -s /bin/bash -c " \
-	    mkdir -p ~/.config/bt-lock-guard ~/.local/share/bt-lock-guard; \
-	    echo '{\"mac\":\"'\"$$MAC_UPPER\"'\",\"threshold\":-80,\"misses\":3,\"interval\":1,\"grace\":30,\"enabled\":true}' \
-	        > ~/.config/bt-lock-guard/config.json; \
-	    systemctl --user daemon-reload; \
-	    systemctl --user enable --now bt-lock-daemon@$$MAC_UPPER; \
-	    systemctl --user enable --now bt-lock-tray; \
-	" || echo "[!] Run 'make setup MAC=$$MAC_UPPER' as your normal user"
+	@if [ -n "$(MAC)" ]; then \
+		echo "$(MAC)" | tr '[:lower:]' '[:upper:]' | grep -Eq '$(MAC_RE)' \
+		    || (echo "Invalid MAC: $(MAC)"; exit 1); \
+		REAL_USER="$${SUDO_USER:-$$USER}"; \
+		MAC_UPPER="$$(echo "$(MAC)" | tr '[:lower:]' '[:upper:]')"; \
+		su -l "$$REAL_USER" -s /bin/bash -c " \
+		    mkdir -p ~/.config/bt-lock-guard ~/.local/share/bt-lock-guard; \
+		    printf '%s' '{\"mac\":\"$$MAC_UPPER\",\"threshold\":-80,\"misses\":3,\"interval\":1,\"grace\":30,\"enabled\":true}' \
+		        > ~/.config/bt-lock-guard/config.json; \
+		    systemctl --user daemon-reload; \
+		    systemctl --user enable --now bt-lock-daemon@$$MAC_UPPER; \
+		    systemctl --user enable --now bt-lock-tray; \
+		" || echo "[!] Run 'make setup MAC=$$MAC_UPPER' as your normal user"; \
+		echo ""; \
+		echo "==> Device: $$(echo "$(MAC)" | tr '[:lower:]' '[:upper:]')"; \
+	else \
+		REAL_USER="$${SUDO_USER:-$$USER}"; \
+		su -l "$$REAL_USER" -s /bin/bash -c " \
+		    mkdir -p ~/.config/bt-lock-guard ~/.local/share/bt-lock-guard; \
+		    systemctl --user daemon-reload; \
+		    systemctl --user enable --now bt-lock-tray; \
+		" || true; \
+		echo ""; \
+		echo "==> No device configured yet."; \
+		echo "    Open the tray icon → 'Scan & pick device' to bind your phone/watch."; \
+		echo "    Or re-run: sudo make install MAC=AA:BB:CC:DD:EE:FF"; \
+	fi
 
-	@echo ""
-	@echo "==> $(NAME) installed!"
-	@echo "    Tray icon will appear near Wi-Fi/clock."
-	@echo "    Logs: journalctl --user -u bt-lock-daemon@$(MAC) -f"
+	@echo "==> $(NAME) installed! Tray icon will appear near Wi-Fi/clock."
 
 setup:
 	@[ -n "$(MAC)" ] || (echo "Usage: make setup MAC=AA:BB:CC:DD:EE:FF"; exit 1)
 	@echo "$(MAC)" | tr '[:lower:]' '[:upper:]' | grep -Eq '$(MAC_RE)' || (echo "Invalid MAC: $(MAC)"; exit 1)
 	@MAC_UPPER="$$(echo "$(MAC)" | tr '[:lower:]' '[:upper:]')"; \
 	mkdir -p ~/.config/bt-lock-guard ~/.local/share/bt-lock-guard; \
-	echo '{"mac":"'"$$MAC_UPPER"'","threshold":-80,"misses":3,"interval":1,"grace":30,"enabled":true}' \
+	printf '%s' '{"mac":"'"$$MAC_UPPER"'","threshold":-80,"misses":3,"interval":1,"grace":30,"enabled":true}' \
 	    > ~/.config/bt-lock-guard/config.json; \
 	systemctl --user daemon-reload; \
 	systemctl --user enable --now bt-lock-daemon@$$MAC_UPPER; \
