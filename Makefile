@@ -17,10 +17,17 @@ install:
 	@[ -n "$(MAC)" ] || (echo "Usage: sudo make install MAC=AA:BB:CC:DD:EE:FF"; exit 1)
 	@echo "$(MAC)" | tr '[:lower:]' '[:upper:]' | grep -Eq '$(MAC_RE)' || (echo "Invalid MAC: $(MAC)"; exit 1)
 	@echo "==> Installing $(NAME)..."
-	@if command -v apt-get >/dev/null 2>&1; then \
-		echo "==> Installing dependencies..."; \
+	@echo "==> Installing dependencies..."; \
+	if command -v pacman >/dev/null 2>&1; then \
+		pacman -Sy --noconfirm bluez bluez-utils python-pyqt5 python-dbus; \
+		systemctl enable --now bluetooth.service || echo "[!] Run: sudo systemctl enable --now bluetooth.service"; \
+	elif command -v apt-get >/dev/null 2>&1; then \
 		apt-get update -qq || true; \
 		apt-get install -y bluez python3-pyqt5 python3-dbus; \
+	elif command -v dnf >/dev/null 2>&1; then \
+		dnf install -y bluez python3-pyqt5 python3-dbus; \
+	else \
+		echo "[!] Unknown package manager — install bluez, bluez-utils, python-pyqt5, python-dbus manually."; \
 	fi
 
 	install -Dm755 src/bt-lock-daemon           $(DESTDIR)$(PREFIX)/bin/bt-lock-daemon

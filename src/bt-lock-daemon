@@ -231,7 +231,7 @@ def ping_device(mac: str) -> bool:
     except subprocess.TimeoutExpired:
         return False
     except FileNotFoundError:
-        log.error("l2ping not found: sudo apt install bluez")
+        log.error("l2ping not found — install bluez-utils (Arch/Manjaro) or bluez (Debian/Ubuntu)")
         sys.exit(1)
 
 

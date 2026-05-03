@@ -26,13 +26,13 @@ Phone returns → unlock → grace period → monitoring resumes
 
 ## Install
 
-### One-liner (Debian / Kali / Ubuntu)
+### One-liner (auto-detects Arch/Manjaro, Debian/Ubuntu/Kali, Fedora)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SolVerNA/bt-lock-guard/master/install.sh | sudo bash
 ```
 
-Installer asks for the target Bluetooth MAC during setup.
+Installer detects your package manager, installs the right dependencies, and asks for the target Bluetooth MAC during setup.
 
 ### From source
 
@@ -42,7 +42,26 @@ cd bt-lock-guard
 sudo make install MAC=AA:BB:CC:DD:EE:FF
 ```
 
-`make install` now installs required Debian packages automatically (`bluez`, `python3-pyqt5`, `python3-dbus`).
+`make install` detects and installs required packages automatically.
+
+### Arch Linux / Manjaro (manual)
+
+```bash
+sudo pacman -S bluez bluez-utils python-pyqt5 python-dbus
+sudo systemctl enable --now bluetooth.service
+git clone https://github.com/SolVerNA/bt-lock-guard
+cd bt-lock-guard
+sudo make install MAC=AA:BB:CC:DD:EE:FF
+```
+
+### Debian / Ubuntu / Kali (manual)
+
+```bash
+sudo apt-get install bluez python3-pyqt5 python3-dbus
+git clone https://github.com/SolVerNA/bt-lock-guard
+cd bt-lock-guard
+sudo make install MAC=AA:BB:CC:DD:EE:FF
+```
 
 ### Device selection in tray window
 
@@ -51,10 +70,14 @@ The popup shows status and controls (enable/disable + threshold), while device b
 
 ## Requirements
 
-- `bluez` (`bluetoothctl`, `l2ping`, `hcitool`)
-- `python3-pyqt5`
-- `python3-dbus`
-- systemd + KDE Plasma (X11)
+| Package | Arch / Manjaro | Debian / Ubuntu |
+|---------|---------------|-----------------|
+| Bluetooth daemon + tools | `bluez` | `bluez` |
+| l2ping, hcitool | `bluez-utils` | included in `bluez` |
+| Qt5 tray UI | `python-pyqt5` | `python3-pyqt5` |
+| D-Bus bindings | `python-dbus` | `python3-dbus` |
+
+- systemd + KDE Plasma (X11 or Wayland)
 
 ## Threshold guide
 
@@ -83,6 +106,12 @@ journalctl --user -u bt-lock-tray -f
 ```bash
 git clone https://github.com/SolVerNA/bt-lock-guard
 cd bt-lock-guard
+sudo make uninstall
+```
+
+Or if you already have the repo cloned:
+
+```bash
 sudo make uninstall
 ```
 

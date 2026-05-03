@@ -21,11 +21,39 @@ MAC="${MAC^^}"
 [[ "$MAC" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || error "Invalid MAC: $MAC"
 echo ""
 
+# ── Package manager detection ─────────────────────────────────────────────────
+detect_pm() {
+    if   command -v pacman  &>/dev/null; then echo "pacman"
+    elif command -v apt-get &>/dev/null; then echo "apt"
+    elif command -v dnf     &>/dev/null; then echo "dnf"
+    else echo "unknown"
+    fi
+}
+
 # ── Dependencies ──────────────────────────────────────────────────────────────
 info "Installing dependencies..."
-apt-get update -qq 2>/dev/null || warn "apt-get update had errors"
-apt-get install -y bluez python3-pyqt5 python3-dbus 2>/dev/null || \
-    error "apt-get failed. Check internet connection."
+PM="$(detect_pm)"
+case "$PM" in
+    pacman)
+        pacman -Sy --noconfirm bluez bluez-utils python-pyqt5 python-dbus \
+            || error "pacman failed. Check internet connection."
+        systemctl enable --now bluetooth.service \
+            || warn "Could not enable bluetooth.service — run: sudo systemctl enable --now bluetooth.service"
+        ;;
+    apt)
+        apt-get update -qq 2>/dev/null || warn "apt-get update had errors"
+        apt-get install -y bluez python3-pyqt5 python3-dbus \
+            || error "apt-get failed. Check internet connection."
+        ;;
+    dnf)
+        dnf install -y bluez python3-pyqt5 python3-dbus \
+            || error "dnf failed. Check internet connection."
+        ;;
+    *)
+        warn "Unknown package manager — skipping auto-install."
+        warn "Make sure these are installed: bluez, bluez-utils, python-pyqt5, python-dbus"
+        ;;
+esac
 
 # ── Files ────────────────────────────────────────────────────────────────────
 TMP="$(mktemp -d)"
