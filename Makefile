@@ -33,6 +33,15 @@ install:
 	install -Dm755 src/bt-lock-tray             $(DESTDIR)$(PREFIX)/bin/bt-lock-tray
 	install -Dm644 src/bt-lock-daemon@.service  $(DESTDIR)/usr/lib/systemd/user/bt-lock-daemon@.service
 	install -Dm644 src/bt-lock-tray.service     $(DESTDIR)/usr/lib/systemd/user/bt-lock-tray.service
+	@if command -v gcc >/dev/null 2>&1; then \
+	    echo "==> Building bt-rssi helper (RSSI for BR/EDR)..."; \
+	    gcc -O2 -o $(DESTDIR)$(PREFIX)/bin/bt-rssi src/bt-rssi.c -lbluetooth \
+	        && setcap cap_net_raw+ep $(DESTDIR)$(PREFIX)/bin/bt-rssi \
+	        && echo "==> bt-rssi built — RSSI enabled" \
+	        || echo "[!] bt-rssi build failed — RSSI unavailable"; \
+	else \
+	    echo "[!] gcc not found — skipping bt-rssi, RSSI unavailable"; \
+	fi
 
 	systemctl daemon-reload 2>/dev/null || true
 
@@ -90,6 +99,7 @@ uninstall:
 	" || true
 	rm -f  $(PREFIX)/bin/bt-lock-daemon
 	rm -f  $(PREFIX)/bin/bt-lock-tray
+	rm -f  $(PREFIX)/bin/bt-rssi
 	rm -f  /usr/lib/systemd/user/bt-lock-daemon@.service
 	rm -f  /usr/lib/systemd/user/bt-lock-tray.service
 	systemctl daemon-reload 2>/dev/null || true

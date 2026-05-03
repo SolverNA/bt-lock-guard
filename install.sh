@@ -75,6 +75,39 @@ install -Dm755 "$TMP/bt-lock-tray"            /usr/local/bin/bt-lock-tray
 install -Dm644 "$TMP/bt-lock-daemon@.service" /usr/lib/systemd/user/bt-lock-daemon@.service
 install -Dm644 "$TMP/bt-lock-tray.service"    /usr/lib/systemd/user/bt-lock-tray.service
 
+# ── Build bt-rssi helper (RSSI for BR/EDR without running daemon as root) ─────
+# bt-rssi is a tiny C binary with setcap cap_net_raw+ep — only it gets the raw
+# HCI socket capability, not the entire Python interpreter.
+build_bt_rssi() {
+    step "Building bt-rssi (RSSI for BR/EDR)..."
+
+    # Install build deps
+    case "$PM" in
+        pacman) pacman -S --noconfirm --needed gcc bluez-libs libcap 2>/dev/null || true ;;
+        apt)    apt-get install -y gcc libbluetooth-dev libcap2-bin 2>/dev/null || true ;;
+        dnf)    dnf install -y gcc bluez-libs-devel libcap 2>/dev/null || true ;;
+    esac
+
+    fetch_raw "src/bt-rssi.c" "$TMP/bt-rssi.c" || { warn "Could not download bt-rssi.c — RSSI unavailable"; return; }
+
+    if ! command -v gcc &>/dev/null; then
+        warn "gcc not found — RSSI-based distance locking unavailable (Connected/Disconnected only)"
+        return
+    fi
+
+    gcc -O2 -o /usr/local/bin/bt-rssi "$TMP/bt-rssi.c" -lbluetooth 2>/dev/null \
+        || { warn "bt-rssi compile failed — RSSI unavailable"; return; }
+
+    if command -v setcap &>/dev/null; then
+        setcap cap_net_raw+ep /usr/local/bin/bt-rssi \
+            && info "bt-rssi built and capability set — RSSI enabled" \
+            || warn "setcap failed — RSSI unavailable (run: sudo setcap cap_net_raw+ep /usr/local/bin/bt-rssi)"
+    else
+        warn "setcap not found — install libcap and run: sudo setcap cap_net_raw+ep /usr/local/bin/bt-rssi"
+    fi
+}
+build_bt_rssi
+
 # ── Bluetooth device scanner ──────────────────────────────────────────────────
 # MAC result is written to a temp file to avoid any subshell/stdin scoping issues
 # (su -l inherits the curl pipe as stdin and can consume bytes from it)

@@ -228,15 +228,29 @@ def setup_phase(mac: str, threshold: int) -> None:
 
 def get_rssi(mac: str) -> int | None:
     """
-    Get RSSI via BlueZ D-Bus (primary, no root needed).
-    The RSSI property is populated by BlueZ when the device is
-    connected or recently discovered.
+    Get RSSI in dBm.
+    1. BlueZ D-Bus RSSI property (works for BLE; sometimes BR/EDR).
+    2. bt-rssi helper binary (setcap cap_net_raw+ep, compiled at install).
     """
+    # Try D-Bus first (fast, no subprocess)
     _, props = _find_device_path(mac)
     if props is not None:
         rssi = props.get("RSSI")
         if rssi is not None:
             return int(rssi)
+
+    # Try the bt-rssi binary for BR/EDR
+    try:
+        r = subprocess.run(
+            ["/usr/local/bin/bt-rssi", mac],
+            capture_output=True, text=True, timeout=2
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return int(r.stdout.strip())
+    except FileNotFoundError:
+        pass  # bt-rssi not compiled — install with `make install` from source
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        pass
     return None
 
 
