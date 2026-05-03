@@ -175,20 +175,25 @@ printf '{"mac":"%s","threshold":-80,"misses":3,"interval":1,"grace":30,"enabled"
 chown -R "$REAL_USER:$REAL_USER" "$CFG_DIR" "$STATE_DIR"
 
 # ── Start services ────────────────────────────────────────────────────────────
-# </dev/null prevents su from inheriting the curl pipe as stdin.
-# Explicit XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS are required on Arch
-# for systemctl --user to reach the running user session bus.
+# XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS are required for systemctl --user
+# to reach the running user D-Bus session when invoked from a root context.
+# runuser (util-linux) is more reliable than su -l for this purpose on Arch.
 info "Starting services..."
-DBUS_SOCK="/run/user/$REAL_UID/bus"
-RUNTIME_DIR="/run/user/$REAL_UID"
+XDG_RT="/run/user/$REAL_UID"
+DBUS_SOCK="unix:path=/run/user/$REAL_UID/bus"
 
-su -l "$REAL_USER" -s /bin/bash -c "
-    export XDG_RUNTIME_DIR=$RUNTIME_DIR
-    export DBUS_SESSION_BUS_ADDRESS=unix:path=$DBUS_SOCK
-    systemctl --user daemon-reload
-    systemctl --user enable --now bt-lock-daemon@$MAC
-    systemctl --user enable --now bt-lock-tray
-" </dev/null || warn "Could not start services — run as your user: make setup MAC=$MAC"
+start_user_svc() {
+    runuser -u "$REAL_USER" -- env \
+        XDG_RUNTIME_DIR="$XDG_RT" \
+        DBUS_SESSION_BUS_ADDRESS="$DBUS_SOCK" \
+        systemctl --user "$@"
+}
+
+start_user_svc daemon-reload
+start_user_svc enable --now "bt-lock-daemon@$MAC" \
+    || warn "Could not enable daemon — run: systemctl --user enable --now bt-lock-daemon@$MAC"
+start_user_svc enable --now bt-lock-tray \
+    || warn "Could not enable tray — run: systemctl --user enable --now bt-lock-tray"
 
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
