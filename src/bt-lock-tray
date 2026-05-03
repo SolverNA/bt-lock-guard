@@ -639,13 +639,20 @@ class PopupWindow(QWidget):
         self.move(x, y)
         self.show()
         self.raise_()
-        self.activateWindow()
+        import os
+        if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("QT_QPA_PLATFORM") == "wayland"):
+            self.activateWindow()
         self._visible = True
 
     def hideEvent(self, _):
         self._visible = False
 
     def focusOutEvent(self, _):
+        # On Wayland focus events are unreliable — skip auto-hide to prevent
+        # the popup from immediately closing after it opens.
+        import os
+        if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("QT_QPA_PLATFORM") == "wayland":
+            return
         self.hide()
 
 

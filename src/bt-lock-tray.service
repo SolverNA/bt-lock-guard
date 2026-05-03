@@ -7,10 +7,12 @@ Wants=graphical-session.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/bt-lock-tray
-Restart=on-failure
+Restart=always
 RestartSec=3
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
-PassEnvironment=DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
+PassEnvironment=DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR WAYLAND_DISPLAY QT_QPA_PLATFORM
 
 StandardOutput=journal
 StandardError=journal
