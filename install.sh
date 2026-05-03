@@ -76,9 +76,14 @@ install -Dm644 "$TMP/bt-lock-daemon@.service" /usr/lib/systemd/user/bt-lock-daem
 install -Dm644 "$TMP/bt-lock-tray.service"    /usr/lib/systemd/user/bt-lock-tray.service
 
 # ── Bluetooth device scanner ──────────────────────────────────────────────────
-# NOTE: All `read` calls use </dev/tty so they work when the script is piped
-#       through curl (stdin is the pipe, not the terminal).
+# MAC result is written to a temp file to avoid any subshell/stdin scoping issues
+# (su -l inherits the curl pipe as stdin and can consume bytes from it)
+MAC_FILE="$(mktemp)"
+trap 'rm -rf "$TMP" "$MAC_FILE"' EXIT
+
 pick_device() {
+    local result_file="$1"
+
     step "Powering on Bluetooth..."
     bluetoothctl power on >/dev/null 2>&1 || true
 
@@ -88,10 +93,11 @@ pick_device() {
 
     local i
     for i in $(seq 1 10); do
-        local bar filled empty
+        local filled empty bar
         filled="$(printf '#%.0s' $(seq 1 "$i"))"
         empty="$(printf '.%.0s' $(seq "$((i+1))" 10) 2>/dev/null || true)"
-        printf "\r  [%-10s] %2d/10s " "${filled}${empty}" "$i" >/dev/tty
+        bar="${filled}${empty}"
+        printf "\r  [%-10s] %2d/10s " "$bar" "$i" >/dev/tty
         sleep 1
     done
     printf "\r%-40s\r" " " >/dev/tty
@@ -107,11 +113,10 @@ pick_device() {
         warn "Make sure your device is nearby, Bluetooth is ON and discoverable."
         printf "\n  Enter MAC address manually (AA:BB:CC:DD:EE:FF): " >/dev/tty
         local m; read -r m </dev/tty
-        MAC="${m^^}"
+        printf '%s' "${m^^}" > "$result_file"
         return
     fi
 
-    # Parse devices into parallel arrays
     local -a macs=() names=()
     local n=0
     while IFS= read -r line; do
@@ -125,7 +130,7 @@ pick_device() {
         warn "Could not parse device list."
         printf "\n  Enter MAC address manually (AA:BB:CC:DD:EE:FF): " >/dev/tty
         local m; read -r m </dev/tty
-        MAC="${m^^}"
+        printf '%s' "${m^^}" > "$result_file"
         return
     fi
 
@@ -145,30 +150,45 @@ pick_device() {
         printf "  Select device [1-%d]: " "$n" >/dev/tty
         read -r choice </dev/tty
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= n )); then
-            MAC="${macs[$((choice-1))]}"
-            info "Selected: ${names[$((choice-1))]}  ($MAC)"
+            printf '%s' "${macs[$((choice-1))]}" > "$result_file"
+            info "Selected: ${names[$((choice-1))]}  (${macs[$((choice-1))]})"
             break
         fi
         warn "Enter a number between 1 and $n."
     done
 }
 
-MAC=""
-pick_device
-[[ "$MAC" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || error "Invalid MAC: $MAC"
+pick_device "$MAC_FILE"
+MAC="$(cat "$MAC_FILE")"
+[[ "$MAC" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || error "Invalid MAC: '$MAC'"
 
-# ── Config + services ─────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 REAL_USER="${SUDO_USER:-$USER}"
-info "Configuring for user $REAL_USER..."
+REAL_UID="$(id -u "$REAL_USER")"
+
+info "Writing config for user $REAL_USER..."
+CFG_DIR="/home/$REAL_USER/.config/bt-lock-guard"
+STATE_DIR="/home/$REAL_USER/.local/share/bt-lock-guard"
+mkdir -p "$CFG_DIR" "$STATE_DIR"
+printf '{"mac":"%s","threshold":-80,"misses":3,"interval":1,"grace":30,"enabled":true}' "$MAC" \
+    > "$CFG_DIR/config.json"
+chown -R "$REAL_USER:$REAL_USER" "$CFG_DIR" "$STATE_DIR"
+
+# ── Start services ────────────────────────────────────────────────────────────
+# </dev/null prevents su from inheriting the curl pipe as stdin.
+# Explicit XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS are required on Arch
+# for systemctl --user to reach the running user session bus.
+info "Starting services..."
+DBUS_SOCK="/run/user/$REAL_UID/bus"
+RUNTIME_DIR="/run/user/$REAL_UID"
 
 su -l "$REAL_USER" -s /bin/bash -c "
-    mkdir -p ~/.config/bt-lock-guard ~/.local/share/bt-lock-guard
-    printf '%s' '{\"mac\":\"$MAC\",\"threshold\":-80,\"misses\":3,\"interval\":1,\"grace\":30,\"enabled\":true}' \
-        > ~/.config/bt-lock-guard/config.json
+    export XDG_RUNTIME_DIR=$RUNTIME_DIR
+    export DBUS_SESSION_BUS_ADDRESS=unix:path=$DBUS_SOCK
     systemctl --user daemon-reload
     systemctl --user enable --now bt-lock-daemon@$MAC
     systemctl --user enable --now bt-lock-tray
-" || warn "Could not start services — run: sudo make setup MAC=$MAC"
+" </dev/null || warn "Could not start services — run as your user: make setup MAC=$MAC"
 
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
@@ -178,6 +198,9 @@ echo ""
 echo "  Device : $MAC"
 echo "  Tray icon appears near Wi-Fi/clock in KDE panel."
 echo "  Walk away with your phone — screen will lock."
+echo ""
+echo "  If the tray icon is missing, run:"
+echo "    systemctl --user enable --now bt-lock-tray"
 echo ""
 echo "  Logs:       journalctl --user -u bt-lock-daemon@$MAC -f"
 echo "  Uninstall:  sudo make uninstall"
