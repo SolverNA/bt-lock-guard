@@ -10,6 +10,11 @@ ExecStart=/usr/local/bin/bt-lock-daemon --mac %i
 Restart=on-failure
 RestartSec=5
 
+# CAP_NET_RAW allows l2ping to create raw BT sockets without running as root.
+# Required on Arch/Manjaro where hcitool is removed from bluez-utils.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
 PassEnvironment=DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR
 
 StandardOutput=journal

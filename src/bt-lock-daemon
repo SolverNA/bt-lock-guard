@@ -21,6 +21,12 @@ import sys
 import time
 import fcntl
 
+try:
+    import dbus
+    HAS_DBUS = True
+except ImportError:
+    HAS_DBUS = False
+
 # ── Paths ──────────────────────────────────────────────────────────────────────
 STATE_DIR   = os.path.expanduser("~/.local/share/bt-lock-guard")
 CONFIG_DIR  = os.path.expanduser("~/.config/bt-lock-guard")
@@ -90,14 +96,49 @@ def write_state(mac: str, rssi: int | None, present: bool,
         log.debug("State write error: %s", e)
 
 
+# ── BlueZ D-Bus helpers ────────────────────────────────────────────────────────
+def _bluez_devices() -> dict:
+    """Return {path: props} for all org.bluez.Device1 objects."""
+    if not HAS_DBUS:
+        return {}
+    try:
+        bus = dbus.SystemBus()
+        mgr = dbus.Interface(bus.get_object("org.bluez", "/"),
+                             "org.freedesktop.DBus.ObjectManager")
+        return {
+            path: ifaces["org.bluez.Device1"]
+            for path, ifaces in mgr.GetManagedObjects().items()
+            if "org.bluez.Device1" in ifaces
+        }
+    except Exception as e:
+        log.debug("D-Bus device list error: %s", e)
+        return {}
+
+
+def _find_device_path(mac: str) -> tuple[str | None, dict | None]:
+    """Return (dbus_path, props) for a device by MAC, or (None, None)."""
+    for path, props in _bluez_devices().items():
+        if str(props.get("Address", "")).upper() == mac.upper():
+            return path, props
+    return None, None
+
+
 # ── BlueZ helpers ──────────────────────────────────────────────────────────────
 def bt_is_powered() -> bool:
     """Return True if the Bluetooth adapter is currently powered on."""
+    if HAS_DBUS:
+        try:
+            bus = dbus.SystemBus()
+            mgr = dbus.Interface(bus.get_object("org.bluez", "/"),
+                                 "org.freedesktop.DBus.ObjectManager")
+            for path, ifaces in mgr.GetManagedObjects().items():
+                if "org.bluez.Adapter1" in ifaces:
+                    return bool(ifaces["org.bluez.Adapter1"].get("Powered", False))
+        except Exception:
+            pass
     try:
-        r = subprocess.run(
-            ["bluetoothctl", "show"],
-            capture_output=True, text=True, timeout=5
-        )
+        r = subprocess.run(["bluetoothctl", "show"],
+                           capture_output=True, text=True, timeout=5)
         return "Powered: yes" in r.stdout
     except Exception:
         return False
@@ -106,10 +147,8 @@ def bt_is_powered() -> bool:
 def bt_power_on() -> bool:
     """Power on the Bluetooth adapter. Return True on success."""
     try:
-        r = subprocess.run(
-            ["bluetoothctl", "power", "on"],
-            capture_output=True, text=True, timeout=10
-        )
+        r = subprocess.run(["bluetoothctl", "power", "on"],
+                           capture_output=True, text=True, timeout=10)
         return r.returncode == 0
     except Exception as e:
         log.error("Failed to power on Bluetooth: %s", e)
@@ -118,28 +157,26 @@ def bt_power_on() -> bool:
 
 def is_device_paired(mac: str) -> bool:
     """Return True if the device is already paired."""
+    _, props = _find_device_path(mac)
+    if props is not None:
+        return bool(props.get("Paired", False))
     try:
-        r = subprocess.run(
-            ["bluetoothctl", "info", mac],
-            capture_output=True, text=True, timeout=5
-        )
+        r = subprocess.run(["bluetoothctl", "info", mac],
+                           capture_output=True, text=True, timeout=5)
         return "Paired: yes" in r.stdout
     except Exception:
         return False
 
 
 def pair_device(mac: str) -> bool:
-    """
-    Discover, pair, trust and connect the device.
-    Returns True on success. Blocks up to ~45 seconds.
-    """
+    """Discover, pair, trust and connect the device. Blocks up to ~45 s."""
     log.info("[SETUP] Scanning for %s …", mac)
     scan_proc = subprocess.Popen(
         ["bluetoothctl", "scan", "on"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     try:
-        time.sleep(8)  # 8 s to let the adapter discover nearby devices
+        time.sleep(8)
         log.info("[SETUP] Pairing with %s …", mac)
         r = subprocess.run(
             ["bluetoothctl", "--timeout", "30", "pair", mac],
@@ -148,14 +185,10 @@ def pair_device(mac: str) -> bool:
         out = r.stdout + r.stderr
         if "Pairing successful" in out or "Already Paired" in out:
             log.info("[SETUP] Pairing successful.")
-            subprocess.run(
-                ["bluetoothctl", "trust", mac],
-                capture_output=True, timeout=5
-            )
-            subprocess.run(
-                ["bluetoothctl", "connect", mac],
-                capture_output=True, timeout=10
-            )
+            subprocess.run(["bluetoothctl", "trust", mac],
+                           capture_output=True, timeout=5)
+            subprocess.run(["bluetoothctl", "connect", mac],
+                           capture_output=True, timeout=10)
             return True
         log.warning("[SETUP] Pairing failed: %s", out.strip())
         return False
@@ -170,12 +203,7 @@ def pair_device(mac: str) -> bool:
 
 
 def setup_phase(mac: str, threshold: int) -> None:
-    """
-    Block until Bluetooth is powered on and the device is paired.
-    Updates state.json so the tray can show progress.
-    Only after this returns does the lock-screen monitor start.
-    """
-    # 1. Ensure BT adapter is powered on
+    """Block until BT is powered on and the device is paired."""
     while not bt_is_powered():
         log.info("[SETUP] Bluetooth is off — powering on…")
         write_state(mac, None, False, 0, False, True, threshold, "bt_off")
@@ -183,9 +211,8 @@ def setup_phase(mac: str, threshold: int) -> None:
             log.info("[SETUP] Bluetooth powered on.")
         else:
             log.warning("[SETUP] Could not power on Bluetooth. Retrying in 5 s…")
-            time.sleep(5)  # 5 s between adapter power-on retries
+            time.sleep(5)
 
-    # 2. Pair if the device has never been paired
     if not is_device_paired(mac):
         log.info("[SETUP] Device %s not paired — starting pairing…", mac)
         while not is_device_paired(mac):
@@ -193,7 +220,7 @@ def setup_phase(mac: str, threshold: int) -> None:
             if pair_device(mac):
                 break
             log.info("[SETUP] Pairing unsuccessful. Retrying in 10 s…")
-            time.sleep(10)  # 10 s between pairing retries
+            time.sleep(10)
         log.info("[SETUP] Device %s paired successfully.", mac)
     else:
         log.info("[SETUP] Device %s already paired.", mac)
@@ -201,58 +228,75 @@ def setup_phase(mac: str, threshold: int) -> None:
 
 def get_rssi(mac: str) -> int | None:
     """
-    Get RSSI via hcitool. Returns dBm integer or None.
-    Works only when device is actively connected.
+    Get RSSI via BlueZ D-Bus (primary, no root needed).
+    The RSSI property is populated by BlueZ when the device is
+    connected or recently discovered.
     """
-    try:
-        result = subprocess.run(
-            ["hcitool", "rssi", mac],
-            capture_output=True, text=True, timeout=2
-        )
-        # Output: "RSSI return value: -65"
-        for line in result.stdout.splitlines():
-            if "RSSI return value" in line:
-                return int(line.split(":")[-1].strip())
-    except Exception:
-        pass
+    _, props = _find_device_path(mac)
+    if props is not None:
+        rssi = props.get("RSSI")
+        if rssi is not None:
+            return int(rssi)
     return None
 
 
 def ping_device(mac: str) -> bool:
-    """l2ping — 1 packet, 1.5s timeout. Returns True if device responds."""
+    """
+    Presence check: D-Bus Connected property first (no root needed),
+    l2ping as fallback (needs CAP_NET_RAW — set via AmbientCapabilities
+    in the service file).
+    """
+    # Primary: D-Bus Connected property
+    _, props = _find_device_path(mac)
+    if props is not None and bool(props.get("Connected", False)):
+        return True
+
+    # Fallback: l2ping
     try:
         result = subprocess.run(
             ["l2ping", "-c", "1", "-t", "1", mac],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=1.5,
         )
         return result.returncode == 0
     except subprocess.TimeoutExpired:
         return False
     except FileNotFoundError:
-        log.error("l2ping not found — install bluez-utils (Arch/Manjaro) or bluez (Debian/Ubuntu)")
-        sys.exit(1)
+        log.debug("l2ping not found — using D-Bus only")
+        return False
+    except PermissionError:
+        log.debug("l2ping: permission denied — add AmbientCapabilities=CAP_NET_RAW to service")
+        return False
+    except Exception:
+        return False
 
 
 def force_connect(mac: str) -> None:
-    """Async bluetoothctl connect — does not block main loop."""
+    """Connect device via D-Bus, fall back to bluetoothctl."""
+    path, _ = _find_device_path(mac)
+    if path and HAS_DBUS:
+        try:
+            bus = dbus.SystemBus()
+            device = dbus.Interface(bus.get_object("org.bluez", path),
+                                    "org.bluez.Device1")
+            device.Connect()
+            log.debug("D-Bus connect sent to %s", mac)
+            return
+        except Exception as e:
+            log.debug("D-Bus connect error: %s", e)
     try:
         subprocess.Popen(
             ["bluetoothctl", "connect", mac],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     except Exception as e:
-        log.debug("Connect error: %s", e)
+        log.debug("bluetoothctl connect error: %s", e)
 
 
 def trust_device(mac: str) -> None:
     try:
-        subprocess.run(
-            ["bluetoothctl", "--timeout", "5", "trust", mac],
-            capture_output=True, timeout=7
-        )
+        subprocess.run(["bluetoothctl", "--timeout", "5", "trust", mac],
+                       capture_output=True, timeout=7)
         log.info("Device %s trusted.", mac)
     except Exception as e:
         log.warning("Trust failed: %s", e)
@@ -261,15 +305,12 @@ def trust_device(mac: str) -> None:
 def probe_device(mac: str, attempt_connect: bool) -> tuple[bool, int | None]:
     """
     Returns (present: bool, rssi: int | None).
-    1. Try hcitool rssi (gives actual signal strength when connected)
-    2. Fall back to l2ping (binary present/absent)
+    Uses BlueZ D-Bus for both presence and RSSI (no root required).
+    l2ping is used as a fallback presence check.
     """
-    rssi = get_rssi(mac)
-    if rssi is not None:
-        return True, rssi
+    rssi    = get_rssi(mac)
+    present = ping_device(mac)   # checks Connected via D-Bus first
 
-    # Device not connected or RSSI unavailable — use l2ping
-    present = ping_device(mac)
     if not present and attempt_connect:
         force_connect(mac)
         time.sleep(0.3)
